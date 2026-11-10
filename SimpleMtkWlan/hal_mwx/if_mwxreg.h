@@ -311,6 +311,7 @@
 
 #define	MT_TX_DATA_RING_BASE		0xd4300
 #define	MT7925_TX_MCU_RING_BASE		0xd43f0
+#define	MT7902_TX_MCU_RING_BASE		0xd43f0	/* MCU-WM commands, WFDMA TX ring 15 */
 #define	MT_TX_FWDL_RING_BASE		0xd4400
 #define	MT_TX_MCU_RING_BASE		0xd4410
 

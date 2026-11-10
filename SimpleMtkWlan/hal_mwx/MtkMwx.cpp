@@ -83,6 +83,7 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #define PCI_PRODUCT_MEDIATEK_MT7921K   0x0608
 #define PCI_PRODUCT_MEDIATEK_MT7922    0x7922
 #define PCI_PRODUCT_MEDIATEK_MT7922K   0x0616
+#define PCI_PRODUCT_MEDIATEK_MT7902    0x7902
 
 /*
  * RX rate histogram from the P-RXV (RXD group 3) of unicast frames, to see
@@ -379,6 +380,7 @@ static const struct pci_matchid mwx_devices[] = {
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7921K },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7922 },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7922K },
+	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7902 },
 };
 
 /* Keep the OpenBSD DPRINTF path available, but do not enable it by default.
@@ -389,6 +391,8 @@ static const struct pci_matchid mwx_devices[] = {
 #define	MT7921_FIRMWARE_WM	"mwx-mt7961_ram_code_1"
 #define	MT7922_ROM_PATCH	"mwx-mt7922_patch_mcu_1_1_hdr"
 #define	MT7922_FIRMWARE_WM	"mwx-mt7922_ram_code_1"
+#define	MT7902_ROM_PATCH	"mwx-mt7902_patch_mcu_1_1_hdr"
+#define	MT7902_FIRMWARE_WM	"mwx-mt7902_ram_code_1"
 
 #if NBPFILTER > 0
 struct mwx_rx_radiotap_header {
@@ -494,7 +498,21 @@ struct mwx_vif {
 enum mwx_hw_type {
 	MWX_HW_MT7921,
 	MWX_HW_MT7922,
+	MWX_HW_MT7902,
 };
+
+static inline const char *
+mwx_hw_name(enum mwx_hw_type hwtype)
+{
+	switch (hwtype) {
+	case MWX_HW_MT7902:
+		return "MT7902";
+	case MWX_HW_MT7922:
+		return "MT7922";
+	default:
+		return "MT7921";
+	}
+}
 
 struct mwx_setkey_task_arg {
 	struct ieee80211_node	*ni;
@@ -794,6 +812,7 @@ int	mwx_mcu_wait_resp_msg(struct mwx_softc *, uint32_t, int,
 int		mwx_dma_disable(struct mwx_softc *sc, int force);
 void		mwx_dma_enable(struct mwx_softc *sc);
 int		mwx_pci_flr(struct mwx_softc *, IOPCIDevice *);
+void		mwx_pci_disable_aspm(struct mwx_softc *);
 static void	mwx_node_chan_width(struct ieee80211_node *, uint8_t *, uint8_t *);
 int		mwx_ampdu_rx_start(struct ieee80211com *, struct ieee80211_node *,
 		    uint8_t);
@@ -1193,7 +1212,8 @@ mwx_stop(struct ifnet *ifp)
 
 		mn = &sc->sc_vif.vif_mn;
 		mt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);
-		mwx_mcu_set_deep_sleep(sc, 1);
+		if (sc->sc_hwtype != MWX_HW_MT7902)
+			mwx_mcu_set_deep_sleep(sc, 1);
 		mt7921_mcu_set_mac_enable(sc, 0, 0);
 	}
 
@@ -1524,7 +1544,7 @@ mwx_newstate_task(void *ptr)
 
 	switch (ostate) {
 	case IEEE80211_S_RUN:
-		if (nstate != ostate)
+		if (nstate != ostate && sc->sc_hwtype != MWX_HW_MT7902)
 			mwx_mcu_set_deep_sleep(sc, 1);
 		/*
 		 * Leaving the BSS: tell the firmware the BSS is gone and remove
@@ -2250,8 +2270,13 @@ mwx_intr(void *arg)
 
 		if (intr & MT_INT_RX_DONE_WM)
 			mwx_dma_rx_done(sc, &sc->sc_rxfwdlq);
-		if (intr & MT_INT_RX_DONE_WM2)
-			mwx_dma_rx_done(sc, &sc->sc_rxmcuq);
+		if (intr & MT_INT_RX_DONE_WM2) {
+			/* MT7902 has no MCU-WA ring: all MCU events (pre- and
+			 * post-download, plus TXS/notify) arrive on the shared
+			 * event ring (RX ring 0). */
+			mwx_dma_rx_done(sc, sc->sc_hwtype == MWX_HW_MT7902 ?
+			    &sc->sc_rxfwdlq : &sc->sc_rxmcuq);
+		}
 		if (intr & MT_INT_RX_DONE_DATA)
 			mwx_dma_rx_done(sc, &sc->sc_rxq);
 
@@ -2298,11 +2323,16 @@ mwx_preinit(struct mwx_softc *sc)
 	}
 	MWX_DEV_LOG(sc, "preinit hardware init ok\n");
 
-	if ((rv = mwx_mcu_set_deep_sleep(sc, 1)) != 0) {
+	if (sc->sc_hwtype == MWX_HW_MT7902) {
+		/* mt7902e keeps deep sleep off for this chip
+		 * (dev->pm.ds_enable = false). */
+		MWX_DEV_LOG(sc, "preinit deep sleep skipped on MT7902\n");
+	} else if ((rv = mwx_mcu_set_deep_sleep(sc, 1)) != 0) {
 		MWX_DEV_LOG(sc, "preinit deep sleep enable failed error=%d\n", rv);
 		return rv;
+	} else {
+		MWX_DEV_LOG(sc, "preinit deep sleep enabled\n");
 	}
-	MWX_DEV_LOG(sc, "preinit deep sleep enabled\n");
 
 	ic->ic_sup_rates[IEEE80211_MODE_11B] = ieee80211_std_rateset_11b;
 	ic->ic_sup_rates[IEEE80211_MODE_11G] = ieee80211_std_rateset_11g;
@@ -2456,13 +2486,18 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_dmat = pa->pa_dmat;
 	sc->sc_intr_mask = MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
 	    MT_INT_MCU_CMD;
-	if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922 ||
+	if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7902)
+		sc->sc_hwtype = MWX_HW_MT7902;
+	else if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922 ||
 	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922K)
 		sc->sc_hwtype = MWX_HW_MT7922;
 	else
 		sc->sc_hwtype = MWX_HW_MT7921;
-	MWX_DEV_LOG(sc, "attach hardware type=%s\n",
-	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
+	MWX_DEV_LOG(sc, "attach hardware type=%s\n", mwx_hw_name(sc->sc_hwtype));
+	/* MT7902 has no MCU-WA ring: never enable the WM2 (RX ring 4) done
+	 * bit, and route any stray WM2 event to the shared event ring. */
+	if (sc->sc_hwtype == MWX_HW_MT7902)
+		sc->sc_intr_mask &= ~MT_INT_RX_DONE_WM2;
 
 	memtype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, PCI_MAPREG_START);
 	if (pci_mapreg_map(pa, PCI_MAPREG_START, memtype, 0,
@@ -2472,6 +2507,11 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	}
 	MWX_DEV_LOG(sc, "attach BAR mapped memtype=0x%x size=%zu\n",
 	    memtype, (size_t)sc->sc_mems);
+
+	/* MT7902: keep the PCIe link out of L1, the chip is not stable
+	 * behind ASPM (see mwx_pci_disable_aspm). */
+	if (sc->sc_hwtype == MWX_HW_MT7902)
+		mwx_pci_disable_aspm(sc);
 
 	if (pci_intr_map_msix(pa, 0, &ih) &&
 	    pci_intr_map_msi(pa, &ih) &&
@@ -3275,15 +3315,20 @@ mwx_queue_fill(struct mwx_softc *sc, struct mwx_queue *q)
 int
 mwx_dma_alloc(struct mwx_softc *sc)
 {
+	uint32_t tx_mcu_base;
+	int rx_event_n;
 	int rv;
 
 	MWX_DEV_LOG(sc, "dma alloc start\n");
-	/* TX queues */
+	/* TX queues.  MT7902 programs MCU-WM commands into WFDMA TX ring 15
+	 * (MT7921/MT7922 use ring 17). */
+	tx_mcu_base = sc->sc_hwtype == MWX_HW_MT7902 ?
+	    MT7902_TX_MCU_RING_BASE : MT_TX_MCU_RING_BASE;
 	if ((rv = mwx_queue_alloc(sc, &sc->sc_txq, MWX_TX_RING_COUNT,
 	    MT_TX_DATA_RING_BASE)) != 0)
 		return rv;
 	if ((rv = mwx_queue_alloc(sc, &sc->sc_txmcuq, 256,
-	    MT_TX_MCU_RING_BASE)) != 0)
+	    tx_mcu_base)) != 0)
 		return rv;
 	if ((rv = mwx_queue_alloc(sc, &sc->sc_txfwdlq, 16 /* XXX */,
 	    MT_TX_FWDL_RING_BASE)) != 0)
@@ -3298,7 +3343,15 @@ mwx_dma_alloc(struct mwx_softc *sc)
 	    MT_RX_MCU_RING_BASE)) != 0 ||
 	    (rv = mwx_queue_fill(sc, &sc->sc_rxmcuq)) != 0)
 		return rv;
-	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxfwdlq, 16 /* XXX */,
+	/*
+	 * MT7902 has no MCU-WA ring: pre-download AND post-download MCU
+	 * events (plus TXS/TX-notify) all arrive on RX ring 0, which is
+	 * this queue.  Linux sizes it at 512 entries
+	 * (MT7902_RX_MCU_RING_SIZE); sc_rxmcuq above stays unused/inert
+	 * on MT7902.
+	 */
+	rx_event_n = sc->sc_hwtype == MWX_HW_MT7902 ? 512 : 16 /* XXX */;
+	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxfwdlq, rx_event_n,
 	    MT_RX_FWDL_RING_BASE)) != 0 ||
 	    (rv = mwx_queue_fill(sc, &sc->sc_rxfwdlq)) != 0)
 		return rv;
@@ -4174,21 +4227,43 @@ mwx_dma_enable(struct mwx_softc *sc)
 {
 #define PREFETCH(base, depth)   ((base) << 16 | (depth))
 	/* configure perfetch settings */
-	mwx_write(sc, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x0, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING2_EXT_CTRL, PREFETCH(0x40, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING3_EXT_CTRL, PREFETCH(0x80, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING4_EXT_CTRL, PREFETCH(0xc0, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING5_EXT_CTRL, PREFETCH(0x100, 0x4));
+	if (sc->sc_hwtype == MWX_HW_MT7902) {
+		/*
+		 * MT7902 WFDMA0 prefetch layout (Linux mt792x_dma.c):
+		 * RX rings 0-3, TX rings 0-6, MCU-WM TX on ring 15, FWDL on
+		 * ring 16.  There is no MCU-WA RX ring.
+		 */
+		mwx_write(sc, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x0, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING1_EXT_CTRL, PREFETCH(0x40, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING2_EXT_CTRL, PREFETCH(0x80, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING3_EXT_CTRL, PREFETCH(0xc0, 0x4));
 
-	mwx_write(sc, MT_WFDMA0_TX_RING0_EXT_CTRL, PREFETCH(0x140, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING1_EXT_CTRL, PREFETCH(0x180, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING2_EXT_CTRL, PREFETCH(0x1c0, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING3_EXT_CTRL, PREFETCH(0x200, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING4_EXT_CTRL, PREFETCH(0x240, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING5_EXT_CTRL, PREFETCH(0x280, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING6_EXT_CTRL, PREFETCH(0x2c0, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x340, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING17_EXT_CTRL, PREFETCH(0x380, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING0_EXT_CTRL, PREFETCH(0x100, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING1_EXT_CTRL, PREFETCH(0x140, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING2_EXT_CTRL, PREFETCH(0x180, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING3_EXT_CTRL, PREFETCH(0x1c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING4_EXT_CTRL, PREFETCH(0x200, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING5_EXT_CTRL, PREFETCH(0x240, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING6_EXT_CTRL, PREFETCH(0x280, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH(0x2c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x300, 0x4));
+	} else {
+		mwx_write(sc, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x0, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING2_EXT_CTRL, PREFETCH(0x40, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING3_EXT_CTRL, PREFETCH(0x80, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING4_EXT_CTRL, PREFETCH(0xc0, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING5_EXT_CTRL, PREFETCH(0x100, 0x4));
+
+		mwx_write(sc, MT_WFDMA0_TX_RING0_EXT_CTRL, PREFETCH(0x140, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING1_EXT_CTRL, PREFETCH(0x180, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING2_EXT_CTRL, PREFETCH(0x1c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING3_EXT_CTRL, PREFETCH(0x200, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING4_EXT_CTRL, PREFETCH(0x240, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING5_EXT_CTRL, PREFETCH(0x280, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING6_EXT_CTRL, PREFETCH(0x2c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x340, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING17_EXT_CTRL, PREFETCH(0x380, 0x4));
+	}
 
 	/* reset dma idx */
 	mwx_write(sc, MT_WFDMA0_RST_DTX_PTR, ~0);
@@ -4250,6 +4325,44 @@ mwx_pci_flr(struct mwx_softc *sc, IOPCIDevice *dev)
 	dev->setBusMasterEnable(true);
 	MWX_DEV_LOG(sc, "FLR done vendor=0x%04x\n", dev->configRead16(0));
 	return 0;
+}
+
+/*
+ * MT7902 loses sync with the AP when the PCIe link drops into L1: the wake
+ * handshake does not line up cleanly with the WiFi power state (Linux
+ * users report the same class of failure, and mt7902e ships a
+ * disable_aspm knob).  Clear ASPM L0s/L1 in the Link Control register of
+ * the PCIe capability.  Boot-arg "mtk7902keepaspm=1" keeps the platform
+ * default instead.
+ */
+void
+mwx_pci_disable_aspm(struct mwx_softc *sc)
+{
+	IOPCIDevice *dev = (IOPCIDevice *)sc->sc_tag;
+	UInt8 cap = 0;
+	UInt16 lctl;
+	int keep = 0;
+
+	if (dev == NULL)
+		return;
+	if (PE_parse_boot_argn("mtk7902keepaspm", &keep, sizeof(keep)) &&
+	    keep != 0) {
+		MWX_DEV_LOG(sc, "ASPM left at platform default (boot-arg)\n");
+		return;
+	}
+	if (!dev->findPCICapability(kIOPCICapabilityIDPCIExpress, &cap) ||
+	    cap == 0) {
+		MWX_DEV_LOG(sc, "ASPM: no PCIe capability found\n");
+		return;
+	}
+	lctl = dev->configRead16(cap + 0x10);
+	if ((lctl & 0x3) == 0) {
+		MWX_DEV_LOG(sc, "ASPM already disabled lctl=0x%04x\n", lctl);
+		return;
+	}
+	dev->configWrite16(cap + 0x10, lctl & ~0x3);
+	MWX_DEV_LOG(sc, "ASPM L0s/L1 disabled lctl=0x%04x -> 0x%04x\n",
+	    lctl, lctl & ~0x3);
 }
 
 int
@@ -4540,7 +4653,7 @@ mwx_load_firmware(struct mwx_softc *sc)
 	int i, rv, sem;
 
 	MWX_DEV_LOG(sc, "firmware load start hwtype=%s\n",
-	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
+	    mwx_hw_name(sc->sc_hwtype));
 	reg = mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY;
 	if (reg != 0) {
 		MWX_DEV_LOG(sc, "firmware already downloaded status=0x%08x\n", reg);
@@ -4555,6 +4668,10 @@ mwx_load_firmware(struct mwx_softc *sc)
 	case MWX_HW_MT7922:
 		rompatch = MT7922_ROM_PATCH;
 		fw = MT7922_FIRMWARE_WM;
+		break;
+	case MWX_HW_MT7902:
+		rompatch = MT7902_ROM_PATCH;
+		fw = MT7902_FIRMWARE_WM;
 		break;
 	}
 	MWX_DEV_LOG(sc, "firmware selected patch=%s wm=%s\n", rompatch, fw);
@@ -7723,7 +7840,7 @@ MtkMwx::getFirmwareVersion()
 {
 	if (com == NULL)
 		return "MT792x";
-	return com->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921";
+	return mwx_hw_name(com->sc_hwtype);
 }
 
 int16_t
@@ -7753,7 +7870,11 @@ MtkMwx::getTxNSS()
 const char *
 MtkMwx::getFirmwareName()
 {
-	if (com == NULL || com->sc_hwtype == MWX_HW_MT7922)
+	if (com == NULL)
+		return MT7922_FIRMWARE_WM;
+	if (com->sc_hwtype == MWX_HW_MT7902)
+		return MT7902_FIRMWARE_WM;
+	if (com->sc_hwtype == MWX_HW_MT7922)
 		return MT7922_FIRMWARE_WM;
 	return MT7921_FIRMWARE_WM;
 }
