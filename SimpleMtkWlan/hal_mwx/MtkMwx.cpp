@@ -4144,6 +4144,35 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	rxd_seq = rxd->seq;
 	m_adj(m, sizeof(*rxd));
 
+	/*
+	 * Event forensics: rate-limited one-liner for every MCU event, plus
+	 * loud prints for coredump / assert dumps - the MT7902 WM firmware
+	 * emits those when it rejected a command that wedged the MCU TX
+	 * queue.  grep "WM COREDUMP" / "WM ASSERT_DUMP".
+	 */
+	{
+		static uint32_t	evt_log_count;
+		uint8_t		*p = mtod(m, uint8_t *);
+		size_t		 plen = mbuf_len(m), n;
+		int		 k;
+
+		if (rxd_eid == MCU_EVENT_COREDUMP)
+			printf("%s: WM COREDUMP event eid=0x%02x ext=0x%02x seq=%u\n",
+			    DEVNAME(sc), rxd_eid, rxd_ext_eid, rxd_seq);
+		if (rxd_ext_eid == MCU_EXT_EVENT_ASSERT_DUMP)
+			printf("%s: WM ASSERT_DUMP event eid=0x%02x ext=0x%02x seq=%u\n",
+			    DEVNAME(sc), rxd_eid, rxd_ext_eid, rxd_seq);
+		if (evt_log_count < 128) {
+			printf("%s: evt eid=0x%02x ext=0x%02x seq=%u len=%u p:",
+			    DEVNAME(sc), rxd_eid, rxd_ext_eid, rxd_seq, len);
+			n = plen < 8 ? plen : 8;
+			for (k = 0; k < (int)n; k++)
+				printf(" %02x", p[k]);
+			printf("\n");
+			evt_log_count++;
+		}
+	}
+
 	switch (rxd_eid) {
 	case MCU_EVENT_SCHED_SCAN_DONE:
 	case MCU_EVENT_SCAN_DONE:
