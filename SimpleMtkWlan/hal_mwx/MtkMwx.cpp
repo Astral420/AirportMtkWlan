@@ -1129,9 +1129,28 @@ mwx_init_hw(struct ifnet *ifp)
 		MWX_DEV_LOG(sc, "init monitor beacon filter disable returned %d\n", rv);
 		sc->sc_rxfilter = 0;
 		mwx_set(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
+	} else if (sc->sc_hwtype == MWX_HW_MT7902) {
+		/*
+		 * MT7902 (connac3-generation WM firmware) wedges its MCU TX queue
+		 * when init sends MCU_UNI_CMD_SNIFFER (0x20024) with the MT7921-
+		 * style 12-byte payload: the WM stops fetching descriptors behind
+		 * it and every later command, incl. the first hw scan, times out.
+		 * Linux mt76 never sends sniffer mode outside monitor mode (see
+		 * __mt7925_start() vs mt7925_assign_vif_chanctx()), so skip it
+		 * here as well.
+		 */
+		MWX_DEV_LOG(sc, "init sniffer disable skipped on MT7902\n");
+		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
+		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
 	} else {
 		rv = mt7921_mcu_set_sniffer(sc, 0);
-		MWX_DEV_LOG(sc, "init sniffer disable returned %d\n", rv);
+		if (rv != 0) {
+			/* fail fast: do not keep init going with a wedged MCU */
+			MWX_DEV_LOG(sc, "init sniffer disable failed error=%d\n",
+			    rv);
+			return rv;
+		}
+		MWX_DEV_LOG(sc, "init sniffer disable ok\n");
 		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
 		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
 	}
