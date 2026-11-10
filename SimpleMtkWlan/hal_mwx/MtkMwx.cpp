@@ -4270,7 +4270,16 @@ mwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,
 		rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
 		    SEC_TO_NSEC(3));
 		if (rv != 0) {
-			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+			uint32_t cpu_idx = mwx_read(sc,
+			    sc->sc_txmcuq.mq_regbase + MT_DMA_CPU_IDX);
+			uint32_t dma_idx = mwx_read(sc,
+			    sc->sc_txmcuq.mq_regbase + MT_DMA_DMA_IDX);
+
+			printf("%s: command %x timeout txmcu cpu=%u dma=%u (%s)\n",
+			    DEVNAME(sc), cmd, cpu_idx, dma_idx,
+			    cpu_idx != dma_idx ?
+			    "wm stopped fetching descriptors" :
+			    "wm fetched the cmd but never answered");
 			mwx_reset(sc);
 			return rv;
 		}
@@ -4306,7 +4315,16 @@ mwx_mcu_wait_resp_msg(struct mwx_softc *sc, uint32_t cmd, int seq,
 		rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
 		    SEC_TO_NSEC(3));
 		if (rv != 0) {
-			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+			uint32_t cpu_idx = mwx_read(sc,
+			    sc->sc_txmcuq.mq_regbase + MT_DMA_CPU_IDX);
+			uint32_t dma_idx = mwx_read(sc,
+			    sc->sc_txmcuq.mq_regbase + MT_DMA_DMA_IDX);
+
+			printf("%s: command %x timeout txmcu cpu=%u dma=%u (%s)\n",
+			    DEVNAME(sc), cmd, cpu_idx, dma_idx,
+			    cpu_idx != dma_idx ?
+			    "wm stopped fetching descriptors" :
+			    "wm fetched the cmd but never answered");
 			mwx_reset(sc);
 			return rv;
 		}
