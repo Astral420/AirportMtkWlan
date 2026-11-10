@@ -602,8 +602,14 @@ struct mwx_softc {
 		struct mbuf	*mcu_m;
 		uint32_t	 mcu_cmd;
 		uint32_t	 mcu_int;
+		uint8_t		 mcu_done;
 	}			sc_mcu_wait[16];
 	uint8_t			sc_scan_seq_num;
+
+	/* mtk_skip boot-arg: MCU commands to drop silently (bisection aid) */
+#define	MWX_SKIP_CMD_MAX		16
+	uint32_t		sc_skip_cmd[MWX_SKIP_CMD_MAX];
+	int			sc_n_skip_cmd;
 
 	/* phy / hw */
 	struct mwx_hw_capa	sc_capa;
@@ -2611,6 +2617,38 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_alpha2[0] = '0';
 	sc->sc_alpha2[1] = '0';
 
+	/*
+	 * Boot-arg "mtk_skip=0x20024,0x4001d" (hex, comma-separated): silently
+	 * drop these MCU commands at the TX layer, pretending they succeeded.
+	 * Bisection aid for commands the MT7902 WM firmware chokes on.  Do
+	 * NOT list firmware-download phase commands (0xee scatter, patch
+	 * semaphore, fw start) - those have no safe pre-completed path.
+	 */
+	{
+		char skip_list[128];
+		char *p, *end;
+
+		if (PE_parse_boot_argn("mtk_skip", skip_list,
+		    sizeof(skip_list))) {
+			p = skip_list;
+			while (sc->sc_n_skip_cmd < MWX_SKIP_CMD_MAX &&
+			    *p != '\0') {
+				unsigned long v = strtoul(p, &end, 16);
+
+				if (end == p)
+					break;
+				sc->sc_skip_cmd[sc->sc_n_skip_cmd++] =
+				    (uint32_t)v;
+				MWX_DEV_LOG(sc,
+				    "boot-arg mtk_skip: cmd=0x%08x\n",
+				    (uint32_t)v);
+				if (*end == ',')
+					end++;
+				p = end;
+			}
+		}
+	}
+
 	ic->ic_phytype = IEEE80211_T_OFDM;	/* not only, but not used */
 	ic->ic_opmode = IEEE80211_M_STA;	/* default to BSS mode */
 	ic->ic_state = IEEE80211_S_INIT;
@@ -3868,6 +3906,18 @@ mwx_mcu_set_len(struct mbuf *m, void *end)
 	m_adj(m, -adj);
 }
 
+static int
+mwx_mcu_cmd_skipped(struct mwx_softc *sc, uint32_t cmd)
+{
+	int i;
+
+	for (i = 0; i < sc->sc_n_skip_cmd; i++) {
+		if (sc->sc_skip_cmd[i] == cmd)
+			return 1;
+	}
+	return 0;
+}
+
 int
 mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 {
@@ -3890,6 +3940,24 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 		seq = ++sc->sc_mcu_seq & 0x0f;
 
 	KASSERT(seq < nitems(sc->sc_mcu_wait));
+
+	/*
+	 * mtk_skip boot-arg: drop the command before it reaches the MCU
+	 * ring.  Waited callers get a pre-completed wait slot (mcu_done)
+	 * so init keeps going; fire-and-forget callers just get success.
+	 */
+	if (mwx_mcu_cmd_skipped(sc, cmd)) {
+		MWX_DEV_LOG(sc, "skip cmd=0x%08x per mtk_skip\n", cmd);
+		memset(&sc->sc_mcu_wait[seq], 0, sizeof(sc->sc_mcu_wait[0]));
+		if (seqp != NULL) {
+			sc->sc_mcu_wait[seq].mcu_cmd = cmd;
+			sc->sc_mcu_wait[seq].mcu_done = 1;
+			*seqp = seq;
+		}
+		m_freem(m);
+		return 0;
+	}
+
 	txd_len = cmd & MCU_CMD_FIELD_UNI ? sizeof(*uni_txd) : sizeof(*mcu_txd);
 	tot_len = txd_len + len;
 	lead = m_leadingspace(m);
@@ -4150,6 +4218,7 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 
 		sc->sc_mcu_wait[rxd_seq].mcu_int = mcu_int;
 		sc->sc_mcu_wait[rxd_seq].mcu_m = m;
+		sc->sc_mcu_wait[rxd_seq].mcu_done = 1;
 		wakeup(&sc->sc_mcu_wait[rxd_seq]);
 		return;
 	}
@@ -4165,11 +4234,17 @@ mwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,
 
 	KASSERT(seq < nitems(sc->sc_mcu_wait));
 
-	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
-	if (rv != 0) {
-		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
-		mwx_reset(sc);
-		return rv;
+	if (sc->sc_mcu_wait[seq].mcu_done) {
+		/* mtk_skip pre-completed, or answered before we slept */
+		sc->sc_mcu_wait[seq].mcu_done = 0;
+	} else {
+		rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
+		    SEC_TO_NSEC(3));
+		if (rv != 0) {
+			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+			mwx_reset(sc);
+			return rv;
+		}
 	}
 
 	if (sc->sc_mcu_wait[seq].mcu_m != NULL) {
@@ -4189,11 +4264,23 @@ mwx_mcu_wait_resp_msg(struct mwx_softc *sc, uint32_t cmd, int seq,
 
 	KASSERT(seq < nitems(sc->sc_mcu_wait));
 
-	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
-	if (rv != 0) {
-		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
-		mwx_reset(sc);
-		return rv;
+	if (sc->sc_mcu_wait[seq].mcu_done) {
+		sc->sc_mcu_wait[seq].mcu_done = 0;
+		if (sc->sc_mcu_wait[seq].mcu_m == NULL) {
+			/* mtk_skip: pre-completed slot, no response coming */
+			printf("%s: command %x skipped per mtk_skip\n",
+			    DEVNAME(sc), cmd);
+			return ENOENT;
+		}
+		/* firmware answered before we went to sleep */
+	} else {
+		rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
+		    SEC_TO_NSEC(3));
+		if (rv != 0) {
+			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+			mwx_reset(sc);
+			return rv;
+		}
 	}
 	if (sc->sc_mcu_wait[seq].mcu_m == NULL) {
 		printf("%s: command response missing\n", DEVNAME(sc));
