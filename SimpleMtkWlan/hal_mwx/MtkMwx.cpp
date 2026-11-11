@@ -5533,6 +5533,20 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	req->timeout_value = htole16(nchan * 120);
 	req->channel_min_dwell_time = htole16(120);
 	req->channel_dwell_time = htole16(120);
+	if (sc->sc_hwtype == MWX_HW_MT7902) {
+		/*
+		 * Linux mt76 puts MT7902 on the connac2 scan path and zeroes the
+		 * scan timing there (mt76_connac_mcu_hw_scan: "duration =
+		 * is_connac2() ? 0 : MT76_CONNAC_SCAN_CHANNEL_TIME"; is_connac2()
+		 * includes is_mt7902()), letting the firmware apply its internal
+		 * per-channel defaults. Nonzero dwell values stall the WM mid-scan:
+		 * one probe request goes out, then silence and no
+		 * MCU_EVENT_SCAN_DONE, so no scan results are ever delivered.
+		 */
+		req->timeout_value = 0;
+		req->channel_min_dwell_time = 0;
+		req->channel_dwell_time = 0;
+	}
 
 
 #ifdef NOTYET
