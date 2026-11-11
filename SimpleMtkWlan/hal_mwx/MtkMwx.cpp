@@ -857,6 +857,8 @@ void		mt7921_mcu_tx_done_event(struct mwx_softc *, struct mbuf *);
 void		mwx_end_scan_task(void *);
 void		mt7921_mcu_scan_event(struct mwx_softc *, struct mbuf *);
 int		mt7921_mcu_hw_scan(struct mwx_softc *, int);
+int		mt7921_mcu_set_rx_filter(struct mwx_softc *, uint32_t, uint8_t,
+		    uint32_t);
 int		mt7921_mcu_hw_scan_cancel(struct mwx_softc *);
 int		mt7921_mcu_set_mac_enable(struct mwx_softc *, int, int);
 int		mt7921_mcu_set_channel_domain(struct mwx_softc *);
@@ -1146,7 +1148,6 @@ mwx_init_hw(struct ifnet *ifp)
 		 * here as well.
 		 */
 		MWX_DEV_LOG(sc, "init sniffer disable skipped on MT7902\n");
-		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
 		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
 	} else {
 		rv = mt7921_mcu_set_sniffer(sc, 0);
@@ -1160,8 +1161,32 @@ mwx_init_hw(struct ifnet *ifp)
 		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
 		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
 	}
-	mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
-	MWX_DEV_LOG(sc, "init rxfilter set 0x%08x\n", sc->sc_rxfilter);
+	if (sc->sc_hwtype == MWX_HW_MT7902) {
+		/*
+		 * The MT7902 WM firmware owns the RX filter: Linux mt76
+		 * configures it exclusively through MCU_CE_CMD_SET_RX_FILTER
+		 * (mt7921_configure_filter -> mt7921_mcu_set_rxfilter) and
+		 * never writes MT_WF_RFCR directly. The register value the
+		 * firmware programs at boot (0x001cef1a, read back by
+		 * mwx_mac_init) drops other-BSS beacons, and with the MCU
+		 * command never sent the WM delivers zero frames to the host:
+		 * no beacons, no probe responses, ipkts stays 0, the RX data
+		 * ring is never fetched and the hardware scan never completes.
+		 * Send the exact steady-state config Linux runs scans with:
+		 * filter enabled (fif BIT(31)), no extra drop bits; the
+		 * firmware then reprograms the register itself.
+		 */
+		rv = mt7921_mcu_set_rx_filter(sc, 1U << 31, 0, 0);
+		MWX_DEV_LOG(sc, "init rxfilter mcu enable rv=%d\n", rv);
+		if (rv != 0) {
+			MWX_DEV_LOG(sc, "init rxfilter mcu failed error=%d\n",
+			    rv);
+			return rv;
+		}
+	} else {
+		mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
+		MWX_DEV_LOG(sc, "init rxfilter set 0x%08x\n", sc->sc_rxfilter);
+	}
 
 	ifp->if_flags |= IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
@@ -1493,6 +1518,24 @@ mwx_scan(struct mwx_softc *sc)
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
 	int rv;
+
+	/*
+	 * macOS re-randomizes the interface MAC between scans by stopping
+	 * and restarting the interface. mwx_stop() cancels the running
+	 * firmware scan, and that cancel clears MWX_FLAG_SCANNING, which
+	 * unblocks the deferred SCAN -> SCAN newstate task: it would
+	 * otherwise queue a new START_HW_SCAN right behind the
+	 * delete-station commands while the interface is going away. The
+	 * WM stops consuming MCU commands in that state and only the
+	 * watchdog hard reset recovers it (observed in every run so far:
+	 * command timeouts, mcu_stuck, full firmware reload). Never start
+	 * a firmware scan for a stopped interface.
+	 */
+	if ((ifp->if_flags & IFF_RUNNING) == 0) {
+		MWX_DEV_LOG(sc, "scan skipped: interface not running flags=0x%x "
+		    "sc_flags=0x%x\n", ifp->if_flags, sc->sc_flags);
+		return 0;
+	}
 
 	if (sc->sc_flags & MWX_FLAG_BGSCAN) {
 		rv = mt7921_mcu_hw_scan_cancel(sc);
@@ -5600,6 +5643,40 @@ mt7921_mcu_hw_scan_cancel(struct mwx_softc *sc)
 	if (rv == 0)
 		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
 	return rv;
+}
+
+/*
+ * Configure the RX filter through the MCU, the only way Linux mt76
+ * programs it on MT7902 (mt7921_configure_filter ->
+ * mt7921_mcu_set_rxfilter, payload verbatim). mode 1 applies `fif` as
+ * the whole config, mode 2 only updates the drop bits selected by
+ * bit_map (bit_op 0=set, 1=clear). fif BIT(31) is MT7921_FILTER_ENABLE;
+ * BIT(2)/BIT(5)/BIT(6) are the FCSFAIL/CONTROL/OTHER_BSS pass-through
+ * flags. With the filter enabled and no extra drop bits, the firmware
+ * passes beacons and probe responses from every BSS, which is the
+ * state Linux keeps while scanning.
+ */
+int
+mt7921_mcu_set_rx_filter(struct mwx_softc *sc, uint32_t fif,
+    uint8_t bit_op, uint32_t bit_map)
+{
+	struct {
+		uint8_t	rsv[4];
+		uint8_t	mode;
+		uint8_t	rsv2[3];
+		uint32_t	fif;
+		uint32_t	bit_map;
+		uint8_t	bit_op;
+		uint8_t	pad[51];
+	} __packed req = {
+		.mode = fif ? 1 : 2,
+		.fif = htole32(fif),
+		.bit_map = htole32(bit_map),
+		.bit_op = bit_op,
+	};
+
+	return mwx_mcu_send_msg(sc, MCU_CE_CMD_SET_RX_FILTER, &req,
+	    sizeof(req), NULL);
 }
 
 void
