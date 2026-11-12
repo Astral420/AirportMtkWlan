@@ -1,0 +1,71 @@
+From 2285aa5bd94e22a50bf8aa8f77557706541cd438 Mon Sep 17 00:00:00 2001
+From: mt7902-patches <patches@local>
+Date: Tue, 10 Nov 2026 19:16:18 +0000
+Subject: [PATCH 1/4] mwx: skip MCU_UNI_CMD_SNIFFER on MT7902 init, fail fast
+ on error
+
+Root cause of the "no networks visible" stage: three runs of descriptor
+forensics show the MCU TX ring frozen at index 39 - the descriptor holding
+MCU_UNI_CMD_SNIFFER (0x20024) with the MT7921-style 12-byte payload.  DMA
+poll reads txmcu cpu=45 dma=40 / cpu=43 dma=40: the WM firmware takes
+everything up to and including mt7921_mcu_uni_add_dev (idx 37) and the
+fire-and-forget 0x4001d (idx 38), swallows 0x20024 (idx 39) and never
+fetches again - MCU_CE_CMD_START_HW_SCAN (0x40003, 1186 bytes) sits at
+idx 40 behind the wedge and times out 3 s later, mwx_reset() hard-reloads
+the firmware, init retries, wedge repeats: infinite enable/disable loop.
+
+The MT7902 WM is connac3-generation firmware (build 20251212*, chip=0x13);
+Linux mt76 only sends MCU_UNI_CMD_SNIFFER from monitor-mode channel-ctx
+assignment (mt7925_assign_vif_chanctx), never from __mt7925_start().
+AirportMtkWlan's HAL inherited OpenBSD mwx(4)'s MT7921-era init sequence,
+which disables sniffer mode unconditionally in mwx_init().
+
+So: skip the call on MT7902 (STA path), and check the return value of
+mt7921_mcu_set_sniffer() on the other chips so a wedged MCU fails init
+fast instead of starting a scan that cannot work.
+
+Expected result: init completes, the first hw scan (0x40003) goes through
+and scan results appear.
+
+Tested on: ASUS Vivobook, MT7902 14c3:7902 / AzureWave 1a3b:5520
+---
+ SimpleMtkWlan/hal_mwx/MtkMwx.cpp | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index 9fcace7..8e63104 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -1129,9 +1129,28 @@ mwx_init_hw(struct ifnet *ifp)
+ 		MWX_DEV_LOG(sc, "init monitor beacon filter disable returned %d\n", rv);
+ 		sc->sc_rxfilter = 0;
+ 		mwx_set(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
++	} else if (sc->sc_hwtype == MWX_HW_MT7902) {
++		/*
++		 * MT7902 (connac3-generation WM firmware) wedges its MCU TX queue
++		 * when init sends MCU_UNI_CMD_SNIFFER (0x20024) with the MT7921-
++		 * style 12-byte payload: the WM stops fetching descriptors behind
++		 * it and every later command, incl. the first hw scan, times out.
++		 * Linux mt76 never sends sniffer mode outside monitor mode (see
++		 * __mt7925_start() vs mt7925_assign_vif_chanctx()), so skip it
++		 * here as well.
++		 */
++		MWX_DEV_LOG(sc, "init sniffer disable skipped on MT7902\n");
++		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
++		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
+ 	} else {
+ 		rv = mt7921_mcu_set_sniffer(sc, 0);
+-		MWX_DEV_LOG(sc, "init sniffer disable returned %d\n", rv);
++		if (rv != 0) {
++			/* fail fast: do not keep init going with a wedged MCU */
++			MWX_DEV_LOG(sc, "init sniffer disable failed error=%d\n",
++			    rv);
++			return rv;
++		}
++		MWX_DEV_LOG(sc, "init sniffer disable ok\n");
+ 		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
+ 		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
+ 	}
+-- 
+2.47.3
+

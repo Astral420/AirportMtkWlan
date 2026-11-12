@@ -1,0 +1,181 @@
+From 82255491ef176443d1ac8423b90abd301be9f7d8 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Wed, 11 Nov 2026 09:41:16 +0000
+Subject: [PATCH] mwx: configure MT7902 RX filter via MCU SET_RX_FILTER like
+ the vendor
+
+Run C (patches 0001-0005) showed the WM firmware accepts START_HW_SCAN
+and ACKs a TX'd probe request, but delivers ZERO frames to the host for
+the whole boot: ipkts=0 and the RX data ring DMA index never leaves 0
+(poll dumps). No beacons, no probe responses, hence no scan results,
+and the hardware scan never completes (no MCU_EVENT_SCAN_DONE), leaving
+net80211 parked in S_SCAN on the first channel.
+
+The cause is the RX filter configuration path. Linux mt76 for MT7902
+programs it exclusively through MCU_CE_CMD_SET_RX_FILTER (0x4000a),
+sent from mac80211's configure_filter (mt7921_configure_filter ->
+mt7921_mcu_set_rxfilter), and never writes the MT_WF_RFCR register
+directly - the WM firmware owns the register and reprograms it from its
+own filter state. mwx inherited the OpenBSD MT7921 behaviour of writing
+MT_WF_RFCR directly and never sent the MCU command, so the WM kept its
+boot-time filter (register value 0x001cef1a as read back by
+mwx_mac_init), which drops other-BSS beacons - during a scan every AP
+is another BSS, so nothing ever reached the host.
+
+Send the vendor's exact steady-state scan configuration once at init
+for MT7902: mode 1, fif = MT7921_FILTER_ENABLE (BIT(31)), no drop bits,
+68-byte payload verbatim from mt7921_mcu_set_rxfilter. Keep the direct
+register write for MT7921, where it works (OpenBSD).
+
+Also refuse to start a firmware scan while the interface is being
+stopped. macOS re-randomizes the interface MAC between scans by
+stopping and restarting it; mwx_stop() cancels the running firmware
+scan, which clears MWX_FLAG_SCANNING and unblocks the deferred
+SCAN -> SCAN newstate task, and that task queued a fresh START_HW_SCAN
+right behind the cancel-scan/delete-station commands. In that state the
+WM stopped consuming MCU commands entirely (command timeouts, txmcu
+cpu/dma stuck apart, error 35 on the next enable) and only the watchdog
+hard reset recovered it - seen in every run so far. Gate mwx_scan() on
+IFF_RUNNING, which mwx_stop() clears before the teardown commands.
+---
+ SimpleMtkWlan/hal_mwx/MtkMwx.cpp  | 83 +++++++++++++++++++++++++++++--
+ SimpleMtkWlan/hal_mwx/if_mwxreg.h |  1 +
+ 2 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index 4793c61..59fc7c8 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -857,6 +857,8 @@ void		mt7921_mcu_tx_done_event(struct mwx_softc *, struct mbuf *);
+ void		mwx_end_scan_task(void *);
+ void		mt7921_mcu_scan_event(struct mwx_softc *, struct mbuf *);
+ int		mt7921_mcu_hw_scan(struct mwx_softc *, int);
++int		mt7921_mcu_set_rx_filter(struct mwx_softc *, uint32_t, uint8_t,
++		    uint32_t);
+ int		mt7921_mcu_hw_scan_cancel(struct mwx_softc *);
+ int		mt7921_mcu_set_mac_enable(struct mwx_softc *, int, int);
+ int		mt7921_mcu_set_channel_domain(struct mwx_softc *);
+@@ -1146,7 +1148,6 @@ mwx_init_hw(struct ifnet *ifp)
+ 		 * here as well.
+ 		 */
+ 		MWX_DEV_LOG(sc, "init sniffer disable skipped on MT7902\n");
+-		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
+ 		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
+ 	} else {
+ 		rv = mt7921_mcu_set_sniffer(sc, 0);
+@@ -1160,8 +1161,32 @@ mwx_init_hw(struct ifnet *ifp)
+ 		sc->sc_rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
+ 		mwx_clear(sc, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN);
+ 	}
+-	mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
+-	MWX_DEV_LOG(sc, "init rxfilter set 0x%08x\n", sc->sc_rxfilter);
++	if (sc->sc_hwtype == MWX_HW_MT7902) {
++		/*
++		 * The MT7902 WM firmware owns the RX filter: Linux mt76
++		 * configures it exclusively through MCU_CE_CMD_SET_RX_FILTER
++		 * (mt7921_configure_filter -> mt7921_mcu_set_rxfilter) and
++		 * never writes MT_WF_RFCR directly. The register value the
++		 * firmware programs at boot (0x001cef1a, read back by
++		 * mwx_mac_init) drops other-BSS beacons, and with the MCU
++		 * command never sent the WM delivers zero frames to the host:
++		 * no beacons, no probe responses, ipkts stays 0, the RX data
++		 * ring is never fetched and the hardware scan never completes.
++		 * Send the exact steady-state config Linux runs scans with:
++		 * filter enabled (fif BIT(31)), no extra drop bits; the
++		 * firmware then reprograms the register itself.
++		 */
++		rv = mt7921_mcu_set_rx_filter(sc, 1U << 31, 0, 0);
++		MWX_DEV_LOG(sc, "init rxfilter mcu enable rv=%d\n", rv);
++		if (rv != 0) {
++			MWX_DEV_LOG(sc, "init rxfilter mcu failed error=%d\n",
++			    rv);
++			return rv;
++		}
++	} else {
++		mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
++		MWX_DEV_LOG(sc, "init rxfilter set 0x%08x\n", sc->sc_rxfilter);
++	}
+ 
+ 	ifp->if_flags |= IFF_RUNNING;
+ 	ifq_clr_oactive(&ifp->if_snd);
+@@ -1494,6 +1519,24 @@ mwx_scan(struct mwx_softc *sc)
+ 	struct ifnet *ifp = &ic->ic_if;
+ 	int rv;
+ 
++	/*
++	 * macOS re-randomizes the interface MAC between scans by stopping
++	 * and restarting the interface. mwx_stop() cancels the running
++	 * firmware scan, and that cancel clears MWX_FLAG_SCANNING, which
++	 * unblocks the deferred SCAN -> SCAN newstate task: it would
++	 * otherwise queue a new START_HW_SCAN right behind the
++	 * delete-station commands while the interface is going away. The
++	 * WM stops consuming MCU commands in that state and only the
++	 * watchdog hard reset recovers it (observed in every run so far:
++	 * command timeouts, mcu_stuck, full firmware reload). Never start
++	 * a firmware scan for a stopped interface.
++	 */
++	if ((ifp->if_flags & IFF_RUNNING) == 0) {
++		MWX_DEV_LOG(sc, "scan skipped: interface not running flags=0x%x "
++		    "sc_flags=0x%x\n", ifp->if_flags, sc->sc_flags);
++		return 0;
++	}
++
+ 	if (sc->sc_flags & MWX_FLAG_BGSCAN) {
+ 		rv = mt7921_mcu_hw_scan_cancel(sc);
+ 		if (rv) {
+@@ -5602,6 +5645,40 @@ mt7921_mcu_hw_scan_cancel(struct mwx_softc *sc)
+ 	return rv;
+ }
+ 
++/*
++ * Configure the RX filter through the MCU, the only way Linux mt76
++ * programs it on MT7902 (mt7921_configure_filter ->
++ * mt7921_mcu_set_rxfilter, payload verbatim). mode 1 applies `fif` as
++ * the whole config, mode 2 only updates the drop bits selected by
++ * bit_map (bit_op 0=set, 1=clear). fif BIT(31) is MT7921_FILTER_ENABLE;
++ * BIT(2)/BIT(5)/BIT(6) are the FCSFAIL/CONTROL/OTHER_BSS pass-through
++ * flags. With the filter enabled and no extra drop bits, the firmware
++ * passes beacons and probe responses from every BSS, which is the
++ * state Linux keeps while scanning.
++ */
++int
++mt7921_mcu_set_rx_filter(struct mwx_softc *sc, uint32_t fif,
++    uint8_t bit_op, uint32_t bit_map)
++{
++	struct {
++		uint8_t	rsv[4];
++		uint8_t	mode;
++		uint8_t	rsv2[3];
++		uint32_t	fif;
++		uint32_t	bit_map;
++		uint8_t	bit_op;
++		uint8_t	pad[51];
++	} __packed req = {
++		.mode = fif ? 1 : 2,
++		.fif = htole32(fif),
++		.bit_map = htole32(bit_map),
++		.bit_op = bit_op,
++	};
++
++	return mwx_mcu_send_msg(sc, MCU_CE_CMD_SET_RX_FILTER, &req,
++	    sizeof(req), NULL);
++}
++
+ void
+ mwx_end_scan_task(void *arg)
+ {
+diff --git a/SimpleMtkWlan/hal_mwx/if_mwxreg.h b/SimpleMtkWlan/hal_mwx/if_mwxreg.h
+index 8b65a3d..31cf0cc 100644
+--- a/SimpleMtkWlan/hal_mwx/if_mwxreg.h
++++ b/SimpleMtkWlan/hal_mwx/if_mwxreg.h
+@@ -601,6 +601,7 @@ struct mt76_txwi {
+ #define	MCU_CE_CMD_TEST_CTRL			0x00040001
+ #define	MCU_CE_CMD_START_HW_SCAN		0x00040003
+ #define	MCU_CE_CMD_SET_PS_PROFILE		0x00040005
++#define	MCU_CE_CMD_SET_RX_FILTER		0x0004000a
+ #define	MCU_CE_CMD_SET_CHAN_DOMAIN		0x0004000f
+ #define	MCU_CE_CMD_SET_BSS_CONNECTED		0x00040016
+ #define	MCU_CE_CMD_SET_BSS_ABORT		0x00040017
+-- 
+2.47.3
+

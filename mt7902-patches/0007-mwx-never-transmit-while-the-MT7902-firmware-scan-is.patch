@@ -1,0 +1,119 @@
+From 1b89f21e3092955b6ed7ff75f12ec99953621d55 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Wed, 11 Nov 2026 18:10:52 +0000
+Subject: [PATCH] mwx: never transmit while the MT7902 firmware scan is running
+
+Run D (patches 0001-0006) kept the exact Run C signature: START_HW_SCAN
+accepted, exactly one 79-byte frame transmitted by the host right after
+the command (txseg idx=3 len=79, wcid=2, TxS acked), then total WM
+silence - interrupts frozen (intr_calls=513/514), ipkts=0 for the whole
+boot, no channel hop, no MCU_EVENT_SCAN_DONE, net80211 parked in S_SCAN,
+watchdog hard reset as the only recovery.
+
+That one frame is net80211's legacy "scan next" probe request. mwx_scan()
+sets ic_state to S_SCAN itself and then calls the wrapped net80211
+newstate, which sees ostate == S_SCAN, takes the "scan next" branch and,
+with IEEE80211_F_ASCAN set (ic_flags 0x8803/0x8843 in every run), sends a
+wildcard probe request through the normal TX path on the current channel
+- while the firmware scan engine is starting. The probe's TxS is the last
+event the WM ever delivers, so the wedge happens right after it, in the
+scan engine state. Linux mac80211 stops every transmission for the whole
+scan and the vendor driver never TXs during hw scan; OpenBSD MT7921
+merely tolerates the stray probe.
+
+Suppress it for MT7902: hide IEEE80211_F_ASCAN around the wrapped
+newstate call while MWX_FLAG_SCANNING is set, so net80211 sends no probe
+for the transition and nothing goes over the air during a scan.
+
+Also add two diagnostics to the scan request line (scan_type, probes) and
+a "mtk7902passive=1" boot-arg that keeps the whole scan passive
+(scan_type 0, probe_req_num 0 - what the vendor sends for a scan with no
+SSIDs): if the wedge persists without any probing at all, the problem is
+the channel hop or RX delivery, not the probe engine.
+---
+ SimpleMtkWlan/hal_mwx/MtkMwx.cpp | 44 +++++++++++++++++++++++++++++---
+ 1 file changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index 59fc7c8..92b944f 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -1715,7 +1715,26 @@ mwx_newstate_task(void *ptr)
+ 
+ 	if (rv)
+ 		mwx_reset(sc);
+-	else
++	else if (sc->sc_hwtype == MWX_HW_MT7902 &&
++	    (sc->sc_flags & MWX_FLAG_SCANNING) &&
++	    (ic->ic_flags & IEEE80211_F_ASCAN)) {
++		/*
++		 * Never transmit while the firmware scan runs. net80211's
++		 * "scan next" newstate transition sends a wildcard probe
++		 * request through the normal TX path on the current channel
++		 * right after START_HW_SCAN went out (ic_flags 0x8803/0x8843
++		 * show IEEE80211_F_ASCAN set in every scan run). On MT7902
++		 * that host TX wedges the WM: the probe's TxS is the last
++		 * event the firmware ever delivers - no channel hop, no
++		 * MCU_EVENT_SCAN_DONE, no RX at all - and only the watchdog
++		 * hard reset recovers it. Linux mac80211 stops every
++		 * transmission for the whole scan; hide the active-scan flag
++		 * for this transition and transmit nothing either.
++		 */
++		ic->ic_flags &= ~IEEE80211_F_ASCAN;
++		sc->sc_newstate(ic, nstate, arg);
++		ic->ic_flags |= IEEE80211_F_ASCAN;
++	} else
+ 		sc->sc_newstate(ic, nstate, arg);
+ 	splx(s);
+ }
+@@ -5486,6 +5505,20 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	req->probe_req_num = /* sreq->n_ssids ? 2 : */ 0;
+ 	req->version = 1;
+ 
++	/*
++	 * Diagnostic escape hatch: "mtk7902passive=1" keeps the MT7902 scan
++	 * fully passive - no probe request from the host (suppressed in the
++	 * newstate task) and none from the firmware either (scan_type 0,
++	 * probe_req_num 0, which is exactly what the Linux vendor driver
++	 * sends for a scan request with no SSIDs). APs announce themselves
++	 * with beacons, so networks still show up. Use it to tell a probe
++	 * engine wedge apart from a channel hop / RX delivery wedge.
++	 */
++	int force_passive = 0;
++	if (sc->sc_hwtype == MWX_HW_MT7902)
++		PE_parse_boot_argn("mtk7902passive", &force_passive,
++		    sizeof(force_passive));
++
+ #ifdef AIRPORT_WCL
+ 	/*
+ 	 * A scan macOS asked for (AirportMtkWlan): active when it wants probes,
+@@ -5493,7 +5526,9 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	 * starts itself stay passive over every channel, as with SimpleMtkWlan.
+ 	 * Like Linux mt76: probing with no SSID is the wildcard (ssid_type 1).
+ 	 */
+-	if (ic->ic_wcl_scan_requested &&
++	if (force_passive) {
++		MWX_DEV_LOG(sc, "scan: mtk7902passive=1, keeping scan passive\n");
++	} else if (ic->ic_wcl_scan_requested &&
+ 	    AirportWCL::scanUsesProbes(true, ic->ic_wcl_scan_active)) {
+ 		req->scan_type = 1;
+ 		req->probe_req_num = 2;
+@@ -5612,12 +5647,13 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ #endif
+ 
+ 	MWX_DEV_LOG(sc,
+-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x\n",
++	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x scan_type=%u probes=%u ssid_type=0x%x\n",
+ 	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
+ 	    req->ext_channels_num, le16toh(req->timeout_value),
+ 	    le16toh(req->channel_dwell_time),
+ 	    le16toh(req->channel_min_dwell_time),
+-	    le32toh(req->scan_func), req->ssid_type);
++	    le32toh(req->scan_func), req->scan_type,
++	    req->probe_req_num, req->ssid_type);
+ 
+ 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
+ 	if (rv != 0)
+-- 
+2.47.3
+

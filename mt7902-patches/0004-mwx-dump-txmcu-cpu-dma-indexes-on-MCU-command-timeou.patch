@@ -1,0 +1,59 @@
+From 3845377f563c80d81c083e42d1c1d2cecbc593ba Mon Sep 17 00:00:00 2001
+From: mt7902-patches <patches@local>
+Date: Tue, 10 Nov 2026 19:19:25 +0000
+Subject: [PATCH 4/4] mwx: dump txmcu cpu/dma indexes on MCU command timeout
+
+On the 3 s wait timeout, read the MCU TX queue CPU/DMA indexes the same
+way the watchdog poll does and put them in the timeout line:
+
+- cpu > dma  -> WM stopped fetching descriptors; the wedge point is the
+  first descriptor after dma (bisect with mtk_skip);
+- cpu == dma -> WM fetched the command but never answered (different
+  failure class: response routing / event format problem).
+---
+ SimpleMtkWlan/hal_mwx/MtkMwx.cpp | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index e7dda0d..ba81361 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -4270,7 +4270,16 @@ mwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,
+ 		rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
+ 		    SEC_TO_NSEC(3));
+ 		if (rv != 0) {
+-			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
++			uint32_t cpu_idx = mwx_read(sc,
++			    sc->sc_txmcuq.mq_regbase + MT_DMA_CPU_IDX);
++			uint32_t dma_idx = mwx_read(sc,
++			    sc->sc_txmcuq.mq_regbase + MT_DMA_DMA_IDX);
++
++			printf("%s: command %x timeout txmcu cpu=%u dma=%u (%s)\n",
++			    DEVNAME(sc), cmd, cpu_idx, dma_idx,
++			    cpu_idx != dma_idx ?
++			    "wm stopped fetching descriptors" :
++			    "wm fetched the cmd but never answered");
+ 			mwx_reset(sc);
+ 			return rv;
+ 		}
+@@ -4306,7 +4315,16 @@ mwx_mcu_wait_resp_msg(struct mwx_softc *sc, uint32_t cmd, int seq,
+ 		rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
+ 		    SEC_TO_NSEC(3));
+ 		if (rv != 0) {
+-			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
++			uint32_t cpu_idx = mwx_read(sc,
++			    sc->sc_txmcuq.mq_regbase + MT_DMA_CPU_IDX);
++			uint32_t dma_idx = mwx_read(sc,
++			    sc->sc_txmcuq.mq_regbase + MT_DMA_DMA_IDX);
++
++			printf("%s: command %x timeout txmcu cpu=%u dma=%u (%s)\n",
++			    DEVNAME(sc), cmd, cpu_idx, dma_idx,
++			    cpu_idx != dma_idx ?
++			    "wm stopped fetching descriptors" :
++			    "wm fetched the cmd but never answered");
+ 			mwx_reset(sc);
+ 			return rv;
+ 		}
+-- 
+2.47.3
+

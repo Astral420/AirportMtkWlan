@@ -1,0 +1,59 @@
+From e918fcc68eefe642d96521936435550596e4e127 Mon Sep 17 00:00:00 2001
+From: mt7902-patches <patches@local>
+Date: Tue, 10 Nov 2026 19:19:25 +0000
+Subject: [PATCH 3/4] mwx: log every MCU event and shout on coredump / assert
+ dumps
+
+Event forensics for connac3 firmware bring-up: one rate-limited line per
+event with eid / ext_eid / seq / len and the first 8 payload bytes, so
+unknown async events (the "mcu rx bad seq 0" events seen after the
+0x20024 wedge) become identifiable, and loud "WM COREDUMP" / "WM
+ASSERT_DUMP" markers (MCU_EVENT_COREDUMP 0xf0, MCU_EXT_EVENT_ASSERT_DUMP
+0x23) when the WM firmware dies.  Cap: 128 lines per boot.
+---
+ SimpleMtkWlan/hal_mwx/MtkMwx.cpp | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index 610a8cf..e7dda0d 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -4144,6 +4144,35 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
+ 	rxd_seq = rxd->seq;
+ 	m_adj(m, sizeof(*rxd));
+ 
++	/*
++	 * Event forensics: rate-limited one-liner for every MCU event, plus
++	 * loud prints for coredump / assert dumps - the MT7902 WM firmware
++	 * emits those when it rejected a command that wedged the MCU TX
++	 * queue.  grep "WM COREDUMP" / "WM ASSERT_DUMP".
++	 */
++	{
++		static uint32_t	evt_log_count;
++		uint8_t		*p = mtod(m, uint8_t *);
++		size_t		 plen = mbuf_len(m), n;
++		int		 k;
++
++		if (rxd_eid == MCU_EVENT_COREDUMP)
++			printf("%s: WM COREDUMP event eid=0x%02x ext=0x%02x seq=%u\n",
++			    DEVNAME(sc), rxd_eid, rxd_ext_eid, rxd_seq);
++		if (rxd_ext_eid == MCU_EXT_EVENT_ASSERT_DUMP)
++			printf("%s: WM ASSERT_DUMP event eid=0x%02x ext=0x%02x seq=%u\n",
++			    DEVNAME(sc), rxd_eid, rxd_ext_eid, rxd_seq);
++		if (evt_log_count < 128) {
++			printf("%s: evt eid=0x%02x ext=0x%02x seq=%u len=%u p:",
++			    DEVNAME(sc), rxd_eid, rxd_ext_eid, rxd_seq, len);
++			n = plen < 8 ? plen : 8;
++			for (k = 0; k < (int)n; k++)
++				printf(" %02x", p[k]);
++			printf("\n");
++			evt_log_count++;
++		}
++	}
++
+ 	switch (rxd_eid) {
+ 	case MCU_EVENT_SCHED_SCAN_DONE:
+ 	case MCU_EVENT_SCAN_DONE:
+-- 
+2.47.3
+

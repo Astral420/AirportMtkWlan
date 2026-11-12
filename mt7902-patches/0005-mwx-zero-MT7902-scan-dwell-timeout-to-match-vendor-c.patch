@@ -1,0 +1,56 @@
+From 56b00cabf2ba5323a081d027343e4f645d1b3896 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Wed, 11 Nov 2026 06:14:49 +0000
+Subject: [PATCH] mwx: zero MT7902 scan dwell/timeout to match vendor connac2
+ values
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The WM firmware accepts the hw-scan command (0x40003) and transmits a
+probe request on the first channel, then stalls: it never hops to the
+next channel and never reports MCU_EVENT_SCAN_DONE (0x0d), so no scan
+results are delivered and the interface shows no networks.
+
+The Linux vendor driver runs this exact firmware and classifies MT7902
+as connac2 (is_connac2() includes is_mt7902()). On that path
+mt76_connac_mcu_hw_scan() computes duration = is_connac2() ? 0 :
+MT76_CONNAC_SCAN_CHANNEL_TIME, i.e. it sends timeout_value,
+channel_min_dwell_time and channel_dwell_time as 0 and lets the
+firmware apply its internal per-channel defaults. mwx hardcodes
+120/120/4920 — the only remaining byte-level difference in the scan
+request.
+
+Zero the three timing fields for MT7902 exactly as the vendor does.
+---
+ SimpleMtkWlan/hal_mwx/MtkMwx.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index ba81361..4793c61 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -5533,6 +5533,20 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	req->timeout_value = htole16(nchan * 120);
+ 	req->channel_min_dwell_time = htole16(120);
+ 	req->channel_dwell_time = htole16(120);
++	if (sc->sc_hwtype == MWX_HW_MT7902) {
++		/*
++		 * Linux mt76 puts MT7902 on the connac2 scan path and zeroes the
++		 * scan timing there (mt76_connac_mcu_hw_scan: "duration =
++		 * is_connac2() ? 0 : MT76_CONNAC_SCAN_CHANNEL_TIME"; is_connac2()
++		 * includes is_mt7902()), letting the firmware apply its internal
++		 * per-channel defaults. Nonzero dwell values stall the WM mid-scan:
++		 * one probe request goes out, then silence and no
++		 * MCU_EVENT_SCAN_DONE, so no scan results are ever delivered.
++		 */
++		req->timeout_value = 0;
++		req->channel_min_dwell_time = 0;
++		req->channel_dwell_time = 0;
++	}
+ 
+ 
+ #ifdef NOTYET
+-- 
+2.47.3
+
